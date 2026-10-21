@@ -1,0 +1,99 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux-x86_64:
+    name: Linux x86_64 (musl static)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install musl-tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build static binary
+        run: make static
+
+      - name: Verify static linking
+        run: |
+          file build/qbixproxy-static
+          file build/qbixproxy-static | grep -q 'statically linked'
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: qbixproxy-linux-x86_64
+          path: build/qbixproxy-static
+
+  build-linux-arm64:
+    name: Linux ARM64 (musl static)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install musl-tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build static binary
+        run: make static
+
+      - name: Verify static linking
+        run: |
+          file build/qbixproxy-static
+          file build/qbixproxy-static | grep -q 'statically linked'
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: qbixproxy-linux-arm64
+          path: build/qbixproxy-static
+
+  release:
+    name: Create GitHub Release
+    needs: [build-linux-x86_64, build-linux-arm64]
+    if: always() && needs.build-linux-x86_64.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Linux x86_64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: qbixproxy-linux-x86_64
+          path: artifacts/linux-x86_64
+
+      - name: Download Linux ARM64 artifact (if available)
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        id: download-arm64
+        with:
+          name: qbixproxy-linux-arm64
+          path: artifacts/linux-arm64
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release
+          cp artifacts/linux-x86_64/qbixproxy-static release/qbixproxy-linux-x86_64
+
+          if [ -f artifacts/linux-arm64/qbixproxy-static ]; then
+            cp artifacts/linux-arm64/qbixproxy-static release/qbixproxy-linux-aarch64
+          else
+            echo "::warning::Linux ARM64 build not available"
+          fi
+
+          chmod +x release/*
+          cd release && sha256sum * > SHA256SUMS
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: RELEASE_NOTES.md
+          files: |
+            release/*

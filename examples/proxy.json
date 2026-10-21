@@ -1,0 +1,47 @@
+{
+  "backends": {
+    "php": {
+      "socket": "/run/php/php-fpm.sock",
+      "protocol": "fastcgi",
+      "document_root": "/var/www/html",
+      "routes": ["/"],
+      "constraints": {
+        "max_body_bytes": 8388608,
+        "max_header_size_bytes": 65536,
+        "max_headers": 100,
+        "max_url_bytes": 8192,
+        "max_query_params": 100,
+        "json_max_depth": 20,
+        "json_max_string": 1048576,
+        "urlenc_max_value": 1048576,
+        "allowed_content_types": [
+          "application/x-www-form-urlencoded",
+          "multipart/form-data",
+          "application/json",
+          "text/plain"
+        ],
+        "allowed_methods": [
+          "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"
+        ],
+        "upload": {
+          "max_files": 20,
+          "max_file_bytes": 10485760,
+          "allowed_extensions": [
+            ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg",
+            ".pdf", ".doc", ".docx", ".xls", ".xlsx",
+            ".zip", ".gz", ".tar",
+            ".mp3", ".mp4", ".webm",
+            ".txt", ".csv", ".json", ".xml"
+          ],
+          "allowed_mime_types": [
+            "image/*",
+            "application/pdf",
+            "application/zip",
+            "text/plain",
+            "text/csv"
+          ]
+        }
+      }
+    }
+  }
+}
