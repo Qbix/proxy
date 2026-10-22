@@ -51,7 +51,53 @@ This means:
 - Not a TLS terminator — sits behind nginx/caddy
 - Not a load balancer — forwards to one matched backend per request
 
-## Installing
+## Automated setup
+
+The fastest way to get protected is the included PHP setup helper. It detects your web server and PHP-FPM configuration automatically, shows you a colored preview of every change before touching anything, then downloads the binary, patches your configs, and installs a systemd service — all with a rollback-safe backup at each step:
+
+```bash
+# Download the helper
+curl -LO https://raw.githubusercontent.com/Qbix/proxy/main/qbixproxy-setup.php
+
+# Step 1: Preview — reads nothing, writes nothing, no root needed
+php qbixproxy-setup.php
+
+# Step 2: Apply
+sudo php qbixproxy-setup.php
+```
+
+The helper supports **nginx**, **Apache**, and **Caddy**, and follows the Debian `sites-available` / `sites-enabled` symlink pattern automatically. If the web server's own config test (`nginx -t`, `apachectl -t`, `caddy validate`) fails after patching, the original config is restored from the `.bak` backup and no reload happens.
+
+```
+Flags:
+  --dry-run        Preview changes without writing anything (default when not root)
+  --yes            Skip the "Continue?" confirmation prompt
+  --server=NAME    Patch only one server: nginx | apache | caddy
+  --help           Show usage
+```
+
+### Not sure if this is safe to run?
+
+That's exactly the right question to ask. The helper is [~800 lines of heavily commented PHP](qbixproxy-setup.php) — no external dependencies, no network calls beyond running standard system commands. Read it yourself, or paste it into an AI assistant and ask it to walk you through what every step does before you run it:
+
+**[→ Ask Claude to review it](https://claude.ai/new?q=I%20want%20to%20protect%20my%20PHP%20server%20from%20CVE-2026-109618%20%28php2shell%29.%20Please%20fetch%20and%20review%20the%20Qbix%20proxy%20setup%20script%20at%20https%3A%2F%2Fraw.githubusercontent.com%2FQbix%2Fproxy%2Fmain%2Fqbixproxy-setup.php%2C%20explain%20what%20it%20does%20step%20by%20step%2C%20and%20walk%20me%20through%20running%20it%20safely%20on%20my%20server.)** · **[→ Ask ChatGPT](https://chatgpt.com/?q=I%20want%20to%20protect%20my%20PHP%20server%20from%20CVE-2026-109618%20%28php2shell%29.%20Please%20fetch%20and%20review%20the%20Qbix%20proxy%20setup%20script%20at%20https%3A%2F%2Fraw.githubusercontent.com%2FQbix%2Fproxy%2Fmain%2Fqbixproxy-setup.php%2C%20explain%20what%20it%20does%20step%20by%20step%2C%20and%20walk%20me%20through%20running%20it%20safely%20on%20my%20server.)**
+
+Or copy this prompt for any AI assistant:
+
+```
+I want to protect my PHP server from CVE-2026-109618 (php2shell). Please fetch
+and review the Qbix proxy setup script at:
+https://raw.githubusercontent.com/Qbix/proxy/main/qbixproxy-setup.php
+
+Explain what it does step by step, confirm it is safe to run, and walk me
+through the process on my server.
+```
+
+The AI will fetch the script from GitHub, read through every function, and guide you step by step. Most people find this more useful than a static how-to guide, because the AI can answer follow-up questions specific to your server setup.
+
+## Installing manually
+
+If you prefer to download the binary yourself, or want to understand what the helper installs, here are the options.
 
 ### Option 1: Download a release binary
 
@@ -98,7 +144,9 @@ make clean          # remove build artifacts
 
 This repo is designed to also be a build target in the [Qbix PHP Webserver](https://github.com/Qbix/webserver) repo, where it compiles alongside the full webserver. Qbix proxy uses stub files to exclude features not needed in proxy-only mode (TLS, HTTP/2, WebSocket, PHP embedding, static file serving).
 
-## Quick start
+## Quick start (manual)
+
+If you prefer to configure your web server by hand, or want to understand what the automated helper does, here are the manual steps.
 
 1. Create a config file (or copy `examples/qbixproxy.json`):
 
@@ -172,7 +220,7 @@ If you're using systemd (the deployment guides include ready-made service files)
 
 ## Web servers
 
-Detailed deployment guides with before-and-after configs, systemd service files, and static file bypass:
+Detailed deployment guides with before-and-after configs, systemd service files, and static file bypass — each with an automated setup section at the top:
 
 - **[nginx](nginx.md)** — replace `fastcgi_pass` with `proxy_pass` through Qbix proxy, with a comparison table of what nginx can and can't do on its own
 - **[Apache](apache.md)** — replace `mod_proxy_fcgi` with `mod_proxy_http` through Qbix proxy, including mod_php → PHP-FPM migration

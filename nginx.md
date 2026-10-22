@@ -16,7 +16,30 @@ Internet → nginx :443 (TLS) → qbixproxy :8080 → php-fpm.sock
 
 nginx still handles TLS, static files, and rate limiting. Qbix proxy handles structural sanitization of every request before it reaches PHP.
 
-## Step 1: Install Qbix proxy
+## Automated setup (recommended)
+
+The fastest way to configure nginx is the included PHP helper. It detects your PHP-FPM socket and nginx config files automatically, shows you a colored preview of every change it will make, then applies everything — binary download, config patches, systemd unit — with a rollback-safe backup:
+
+```bash
+# Download the helper
+curl -LO https://raw.githubusercontent.com/Qbix/proxy/main/qbixproxy-setup.php
+
+# Step 1: Preview — reads nothing, writes nothing, no root needed
+php qbixproxy-setup.php --server=nginx
+
+# Step 2: Apply
+sudo php qbixproxy-setup.php --server=nginx
+```
+
+If the nginx config test fails after patching, the helper restores your original config from the `.bak` backup automatically. No reload happens unless the test passes.
+
+Not sure if it's safe to run? **[Ask Claude to review it](https://claude.ai/new?q=I%20want%20to%20protect%20my%20PHP%20server%20from%20CVE-2026-109618%20%28php2shell%29.%20Please%20fetch%20and%20review%20the%20Qbix%20proxy%20setup%20script%20at%20https%3A%2F%2Fraw.githubusercontent.com%2FQbix%2Fproxy%2Fmain%2Fqbixproxy-setup.php%2C%20explain%20what%20it%20does%20step%20by%20step%2C%20and%20walk%20me%20through%20running%20it%20safely%20on%20my%20server.)** or **[Ask ChatGPT](https://chatgpt.com/?q=I%20want%20to%20protect%20my%20PHP%20server%20from%20CVE-2026-109618%20%28php2shell%29.%20Please%20fetch%20and%20review%20the%20Qbix%20proxy%20setup%20script%20at%20https%3A%2F%2Fraw.githubusercontent.com%2FQbix%2Fproxy%2Fmain%2Fqbixproxy-setup.php%2C%20explain%20what%20it%20does%20step%20by%20step%2C%20and%20walk%20me%20through%20running%20it%20safely%20on%20my%20server.)** — the AI will fetch the script from GitHub and walk you through every step.
+
+## Manual setup
+
+The steps below explain what the automated helper does. Follow them if you prefer to configure things by hand, or want to understand each piece before running the helper.
+
+### Step 1: Install Qbix proxy
 
 ```bash
 # Download the static binary (zero dependencies)
@@ -33,7 +56,7 @@ make static
 sudo cp build/qbixproxy-static /usr/local/bin/qbixproxy
 ```
 
-## Step 2: Create a config file
+### Step 2: Create a config file
 
 Create `/etc/qbixproxy/qbixproxy.json`:
 
@@ -67,7 +90,7 @@ Create `/etc/qbixproxy/qbixproxy.json`:
 
 Adjust the `socket` path to match your PHP-FPM pool config (`listen` directive in your pool's `.conf` file, typically `/etc/php/8.x/fpm/pool.d/www.conf`).
 
-## Step 3: Create a systemd service
+### Step 3: Create a systemd service
 
 Create `/etc/systemd/system/qbixproxy.service`:
 
@@ -103,7 +126,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now qbixproxy
 ```
 
-## Step 4: Update nginx config
+### Step 4: Update nginx config
 
 **Before** (nginx → PHP-FPM directly):
 
@@ -170,7 +193,7 @@ server {
 
 The key change: `fastcgi_pass unix:/run/php/php-fpm.sock` becomes `proxy_pass http://qbixproxy`. nginx now sends HTTP to proxy, and proxy handles the FastCGI protocol to PHP-FPM.
 
-## Step 5: Test and reload
+### Step 5: Test and reload
 
 ```bash
 # Test Qbix proxy config
@@ -183,7 +206,7 @@ sudo nginx -t
 sudo systemctl reload nginx
 ```
 
-## Verify it's working
+### Verify it's working
 
 Check Qbix proxy's health endpoint:
 
@@ -193,7 +216,7 @@ curl http://127.0.0.1:8080/Q/health
 
 Check that your site still works through nginx. If you have Prometheus, scrape `/Q/metrics` on port 8080 to monitor Qbix proxy stats.
 
-## Can nginx do this without Qbix proxy?
+### Can nginx do this without Qbix proxy?
 
 nginx can do some hardening on its own, but it cannot replace structural sanitization:
 
