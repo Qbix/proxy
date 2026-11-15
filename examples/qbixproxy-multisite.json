@@ -1,0 +1,70 @@
+{
+  "_comment": "Multi-site / virtual-hosting example. Each backend has a 'hosts' array so Qbix proxy routes by Host header to the correct PHP-FPM pool and document root. The 'default' backend has no 'hosts' and acts as a catch-all for any unmatched domain.",
+  "backends": {
+    "site-a": {
+      "socket":        "/run/php-fpm/site-a.sock",
+      "protocol":      "fastcgi",
+      "document_root": "/var/www/site-a",
+      "hosts":         ["site-a.example.com", "www.site-a.example.com"],
+      "routes":        ["/"],
+      "constraints": {
+        "max_body_bytes":  8388608,
+        "allowed_methods": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"],
+        "allowed_content_types": [
+          "application/x-www-form-urlencoded",
+          "multipart/form-data",
+          "application/json",
+          "text/plain"
+        ],
+        "upload": {
+          "max_files":          20,
+          "max_file_bytes":     10485760,
+          "allowed_extensions": [".jpg", ".jpeg", ".png", ".gif", ".webp", ".pdf", ".zip"]
+        }
+      }
+    },
+    "site-b": {
+      "socket":        "/run/php-fpm/site-b.sock",
+      "protocol":      "fastcgi",
+      "document_root": "/var/www/site-b",
+      "hosts":         ["site-b.example.com"],
+      "routes":        ["/"],
+      "constraints": {
+        "max_body_bytes":  8388608,
+        "allowed_methods": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"],
+        "allowed_content_types": [
+          "application/x-www-form-urlencoded",
+          "multipart/form-data",
+          "application/json",
+          "text/plain"
+        ],
+        "upload": {
+          "max_files":          20,
+          "max_file_bytes":     10485760,
+          "allowed_extensions": [".jpg", ".jpeg", ".png", ".gif", ".webp", ".pdf", ".zip"]
+        }
+      }
+    },
+    "default": {
+      "_comment":      "Catch-all: no 'hosts' key means this backend handles any domain not matched above.",
+      "socket":        "/run/php-fpm/default.sock",
+      "protocol":      "fastcgi",
+      "document_root": "/var/www/html",
+      "routes":        ["/"],
+      "constraints": {
+        "max_body_bytes":  8388608,
+        "allowed_methods": ["GET", "POST", "DELETE", "HEAD", "OPTIONS"],
+        "allowed_content_types": [
+          "application/x-www-form-urlencoded",
+          "multipart/form-data",
+          "application/json"
+        ],
+        "upload": {
+          "max_files":          5,
+          "max_file_bytes":     5242880,
+          "allowed_extensions": [".jpg", ".jpeg", ".png", ".gif", ".pdf"]
+        }
+      }
+    }
+  }
+}

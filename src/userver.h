@@ -150,6 +150,7 @@ typedef struct UJson UJson;
 
 #define PROXY_MAX_BACKENDS    16
 #define PROXY_MAX_ROUTES      32
+#define PROXY_MAX_HOSTS       32
 #define PROXY_MAX_CTYPES      16
 #define PROXY_MAX_METHODS      8
 #define PROXY_MAX_EXTENSIONS  32
@@ -186,6 +187,8 @@ typedef struct {
     char*               name;                       /* "php", "node", ... */
     char*               socket_path;                /* Unix socket */
     UProxyProto         protocol;                   /* fastcgi or http */
+    char*               hosts[PROXY_MAX_HOSTS];     /* Host header matches; empty = catch-all */
+    int                 n_hosts;
     char*               routes[PROXY_MAX_ROUTES];   /* prefix matches */
     int                 n_routes;
     UBackendConstraints constraints;

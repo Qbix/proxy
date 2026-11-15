@@ -53,20 +53,27 @@ This means:
 
 ## Automated setup
 
-The fastest way to get protected is the included PHP setup helper. It detects your web server and PHP-FPM configuration automatically, shows you a colored preview of every change before touching anything, then downloads the binary, patches your configs, and installs a systemd service — all with a rollback-safe backup at each step:
+The fastest way to get protected is the included PHP setup helper. It detects your web server and PHP-FPM configuration automatically, shows you a colored preview of every change before touching anything, then downloads the binary, patches your configs, and installs a systemd service — all with a rollback-safe backup at each step.
+
+**Before running any setup script you download from the internet, read it.** This one is [~800 lines of heavily commented PHP](qbixproxy-setup.php) and is designed to be auditable — but unlike the proxy binary itself (which only touches network sockets), the setup script reads your web server config files and writes to `/etc`. Take two minutes to look through it, or paste it into an AI assistant and ask it to explain every step (see the section below for a one-click prompt).
 
 ```bash
-# Download the helper
-curl -LO https://raw.githubusercontent.com/Qbix/proxy/main/qbixproxy-setup.php
+# Download
+curl -fsSL https://raw.githubusercontent.com/Qbix/proxy/main/qbixproxy-setup.php -o qbixproxy-setup.php
 
-# Step 1: Preview — reads nothing, writes nothing, no root needed
+# Read it first — seriously
+less qbixproxy-setup.php
+
+# Step 1: Preview — reads config files, writes nothing, no root needed.
+# Shows every change that would be made, plus exact copy-paste steps if you
+# prefer to apply them yourself rather than running the script as root.
 php qbixproxy-setup.php
 
-# Step 2: Apply
+# Step 2: Apply (only after you're satisfied with the preview)
 sudo php qbixproxy-setup.php
 ```
 
-The helper supports **nginx**, **Apache**, and **Caddy**, and follows the Debian `sites-available` / `sites-enabled` symlink pattern automatically. If the web server's own config test (`nginx -t`, `apachectl -t`, `caddy validate`) fails after patching, the original config is restored from the `.bak` backup and no reload happens.
+The helper supports **nginx**, **Apache**, and **Caddy**, and follows the Debian `sites-available` / `sites-enabled` symlink pattern automatically. It auto-detects all virtual hosts across all three servers and generates one backend per site with the correct `document_root`. If the web server's own config test (`nginx -t`, `apachectl -t`, `caddy validate`) fails after patching, the original config is restored from the `.bak` backup and no reload happens.
 
 ```
 Flags:
@@ -236,6 +243,99 @@ nginx, Apache, and Caddy don't parse multipart request bodies — they have no r
 
 The Qbix webserver also handles TLS (with automatic certificate management), virtual hosting, static file serving, and HTTP/2 — so there's no reverse proxy to configure and fewer moving parts overall. If you're currently running nginx or Apache just to sit in front of PHP-FPM, it's worth a look: [github.com/Qbix/webserver](https://github.com/Qbix/webserver).
 
+## Multiple sites / virtual hosting
+
+A single Qbix proxy instance can protect multiple PHP sites, each with its own document root and PHP-FPM socket. This is the typical multi-tenant or virtual-hosting setup.
+
+Each backend can have an optional `hosts` array. When present, the backend only handles requests whose `Host` header matches one of the listed values (port suffix stripped, case-insensitive). A backend with no `hosts` array is a catch-all and handles any host.
+
+```json
+{
+  "backends": {
+    "groups": {
+      "socket":        "/run/php-fpm/groups.sock",
+      "protocol":      "fastcgi",
+      "document_root": "/var/www/groups.do",
+      "hosts":         ["groups.do", "www.groups.do"],
+      "routes":        ["/"]
+    },
+    "qbix": {
+      "socket":        "/run/php-fpm/qbix.sock",
+      "protocol":      "fastcgi",
+      "document_root": "/var/www/qbix.com",
+      "hosts":         ["qbix.com", "www.qbix.com"],
+      "routes":        ["/"]
+    },
+    "default": {
+      "socket":        "/run/php-fpm/default.sock",
+      "protocol":      "fastcgi",
+      "document_root": "/var/www/html",
+      "routes":        ["/"]
+    }
+  }
+}
+```
+
+**Matching rules:**
+
+1. Host-specific backends (those with `hosts`) are tried first, in declaration order.
+2. The request's `Host` header is compared against each entry (port and case ignored).
+3. If the host matches and the route prefix also matches, that backend handles the request.
+4. If no host-specific backend matches, catch-all backends (no `hosts` key) are tried by route prefix.
+
+**nginx — single upstream, all sites:**
+
+With virtual hosting, you use **one** nginx `upstream` block pointing at Qbix proxy's single port, then use `proxy_pass` in each `server {}` block. Qbix proxy reads the `Host` header and routes to the correct backend automatically — nginx just needs to forward `Host $host`.
+
+```nginx
+upstream qbixproxy {
+    server 127.0.0.1:8080;
+    keepalive 32;
+}
+
+server {
+    listen 443 ssl;
+    server_name groups.do www.groups.do;
+    # ... ssl_certificate, etc.
+
+    location ~* \.(css|js|jpg|jpeg|png|gif|ico|svg|woff2?)$ {
+        root /var/www/groups.do;
+        expires 30d;
+    }
+    location / {
+        proxy_pass         http://qbixproxy;
+        proxy_http_version 1.1;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+        proxy_set_header   Connection        "";
+    }
+}
+
+server {
+    listen 443 ssl;
+    server_name qbix.com www.qbix.com;
+    # ... ssl_certificate, etc.
+
+    location ~* \.(css|js|jpg|jpeg|png|gif|ico|svg|woff2?)$ {
+        root /var/www/qbix.com;
+        expires 30d;
+    }
+    location / {
+        proxy_pass         http://qbixproxy;
+        proxy_http_version 1.1;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+        proxy_set_header   Connection        "";
+    }
+}
+```
+
+The `upstream` block appears once; both `server {}` blocks share it. Qbix proxy routes by `Host` to the right PHP-FPM pool with the right `DOCUMENT_ROOT` for each site.
+
 ### Configuration reference
 
 Backend fields:
@@ -245,6 +345,7 @@ Backend fields:
 | `socket` | Unix socket path to the backend |
 | `protocol` | `fastcgi` (default) or `http` |
 | `document_root` | Passed as `DOCUMENT_ROOT` to FastCGI |
+| `hosts` | Optional. Host header values this backend handles. No entry = catch-all for any host. |
 | `routes` | URL prefixes this backend handles |
 | `constraints` | Validation limits (see `examples/qbixproxy.json` for all options) |
 

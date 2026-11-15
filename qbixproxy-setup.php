@@ -349,10 +349,21 @@ function findNginxPhpFiles(): array {
         if (!is_dir($dir)) continue;
         foreach (array_merge(glob("$dir/*.conf") ?: [], glob("$dir/*") ?: []) as $f) {
             if (!is_file($f) && !is_link($f)) continue;
+            // Skip backup and failed-attempt files — they are not loaded by nginx
+            // and must never be patched (patching .bak creates .bak.bak chaos and
+            // leaves the actual live config untouched).
+            $base = basename($f);
+            if (preg_match('/\.(bak|failed|orig|save|old|disabled)(\.|$)/i', $base)) continue;
             $real = realFile($f);
+            if (preg_match('/\.(bak|failed|orig|save|old|disabled)(\.|$)/i', basename($real))) continue;
             // Strip comments before checking — avoids false positives from examples
             $c = stripComments((string) @file_get_contents($real));
-            if (stripos($c, 'fastcgi_pass') !== false && !isset($found[$real])) {
+            // Include files that need new patching (fastcgi_pass) OR
+            // files that need recovery (old-format patch with inline upstream block).
+            $needsPatch    = stripos($c, 'fastcgi_pass') !== false;
+            $needsRecovery = strpos($c, 'upstream qbixproxy') !== false
+                          && strpos($c, 'proxy_pass http://qbixproxy') !== false;
+            if (($needsPatch || $needsRecovery) && !isset($found[$real])) {
                 $found[$real] = ['link' => $f, 'real' => $real, 'source' => $dir];
             }
         }
@@ -389,10 +400,18 @@ function findApachePhpFiles(): array {
         if (!is_dir($dir)) continue;
         foreach (array_merge(glob("$dir/*.conf") ?: [], glob("$dir/*") ?: []) as $f) {
             if (!is_file($f) && !is_link($f)) continue;
+            // Skip backup and failed-attempt files
+            $base = basename($f);
+            if (preg_match('/\.(bak|failed|orig|save|old|disabled)(\.|$)/i', $base)) continue;
             $real = realFile($f);
+            if (preg_match('/\.(bak|failed|orig|save|old|disabled)(\.|$)/i', basename($real))) continue;
             $c = stripComments((string) @file_get_contents($real));
-            // Match FilesMatch PHP handler, mod_proxy_fcgi SetHandler, or ProxyPassMatch
+            // Match FilesMatch PHP handler, mod_proxy_fcgi SetHandler, or ProxyPassMatch.
+            // Require a VirtualHost block — global PHP handler files (e.g. /etc/httpd/conf.d/php.conf
+            // that define a system-wide FilesMatch for all hosts) must not be patched here;
+            // they would affect every vhost and conflict with our per-site proxy_pass approach.
             if (preg_match('/FilesMatch.*php|SetHandler.*fcgi|proxy:unix|ProxyPassMatch.*php/i', $c)
+                && preg_match('/<VirtualHost/i', $c)
                 && !isset($found[$real])
             ) {
                 $found[$real] = ['link' => $f, 'real' => $real, 'source' => $dir];
@@ -423,7 +442,9 @@ function findCaddyPhpFiles(): array {
 
     foreach ($candidates as $f) {
         if (!is_file($f)) continue;
+        if (preg_match('/\.(bak|failed|orig|save|old|disabled)(\.|$)/i', basename($f))) continue;
         $real = realFile($f);
+        if (preg_match('/\.(bak|failed|orig|save|old|disabled)(\.|$)/i', basename($real))) continue;
         $c = (string) @file_get_contents($real);
         if (stripos($c, 'php_fastcgi') !== false && !isset($found[$real])) {
             $found[$real] = ['link' => $f, 'real' => $real, 'source' => dirname($f)];
@@ -585,9 +606,9 @@ function removeNginxSlashLocation(string $txt): string {
  * need the sanitization that Qbix proxy provides.
  */
 function patchNginx(string $txt): string {
-    // Idempotency guard: if this config already has our upstream block,
+    // Idempotency guard: if this config already proxies to qbixproxy,
     // it's already patched — return unchanged
-    if (strpos($txt, 'upstream qbixproxy') !== false) return $txt;
+    if (strpos($txt, 'proxy_pass http://qbixproxy') !== false) return $txt;
 
     // Step 1: Remove existing PHP FastCGI location blocks
     $txt = removeNginxPhpLocations($txt);
@@ -595,10 +616,8 @@ function patchNginx(string $txt): string {
     // Step 2: Remove the generic location / {} block (we'll add our own)
     $txt = removeNginxSlashLocation($txt);
 
-    // Step 3: Add the upstream block just before the first server { }
-    // nginx's upstream directive must appear at the http { } level, before server { }
-    $upstream = "upstream qbixproxy {\n    server 127.0.0.1:8080;\n    keepalive 32;\n}\n\n";
-    $txt = preg_replace('/(\bserver\s*\{)/', $upstream . '$1', $txt, 1) ?? $txt;
+    // Step 3: (upstream block is written once to 00-qbixproxy-upstream.conf,
+    // not into each site config — nginx forbids duplicate upstream definitions)
 
     // Step 4: Define the replacement location blocks
     // We use a heredoc for readability — the indentation matches typical nginx style
@@ -643,6 +662,25 @@ NGINX;
 
     // Clean up: collapse runs of 3+ blank lines to 2
     return (string) preg_replace('/\n{3,}/', "\n\n", $txt);
+}
+
+/**
+ * Strip a legacy inline "upstream qbixproxy { ... }" block that older versions
+ * of this script injected directly into each site config.  nginx forbids
+ * duplicate upstream definitions, so when two or more sites are present the
+ * second patchNginx() call would fail with "duplicate upstream 'qbixproxy'".
+ *
+ * Recovery path: if a file already has BOTH the inline upstream block AND the
+ * proxy_pass directive (i.e. it was patched by an older version of this script),
+ * we strip the upstream block so nginx is happy, then leave proxy_pass in place.
+ * The upstream is now defined once in 00-qbixproxy-upstream.conf.
+ */
+function stripNginxInlineUpstream(string $txt): string {
+    return (string) preg_replace(
+        '/\bupstream\s+qbixproxy\s*\{[^}]*\}\s*\n*/s',
+        '',
+        $txt
+    );
 }
 
 // ─── apache config patching ───────────────────────────────────────────────────
@@ -824,7 +862,7 @@ function showKeyChanges(string $server, string $orig, string $patched): void {
 
     // Patterns for key lines we're adding (proxy directives)
     $addPattern = '/proxy_pass\s+http:\/\/qbixproxy|ProxyPass\s+\/\s+http:\/\/127|'
-                . 'reverse_proxy\s+127\.0\.0\.1:8080|upstream\s+qbixproxy|'
+                . 'reverse_proxy\s+127\.0\.0\.1:8080|'
                 . 'ProxyPreserveHost|handle_up\s+X-Real|header_up\s+X-Real/i';
 
     $shown = 0;
@@ -850,48 +888,88 @@ function showKeyChanges(string $server, string $orig, string $patched): void {
 // ─── config file generators ───────────────────────────────────────────────────
 
 /**
+ * Default constraints block applied to every backend.
+ *
+ * These are intentionally conservative. After setup, edit
+ * /etc/qbixproxy/qbixproxy.json to adjust limits per-site.
+ */
+function defaultConstraints(): array {
+    return [
+        'max_body_bytes'        => 8388608,
+        'allowed_methods'       => ['GET','POST','PUT','PATCH','DELETE','HEAD','OPTIONS'],
+        'allowed_content_types' => [
+            'application/x-www-form-urlencoded',
+            'multipart/form-data',
+            'application/json',
+            'text/plain',
+        ],
+        'upload' => [
+            'max_files'          => 20,
+            'max_file_bytes'     => 10485760,
+            'allowed_extensions' => [
+                '.jpg','.jpeg','.png','.gif','.webp',
+                '.pdf','.zip','.doc','.docx','.xls','.xlsx',
+            ],
+        ],
+    ];
+}
+
+/**
  * Generate the qbixproxy.json config file.
  *
  * This tells Qbix proxy:
  *   - Where PHP-FPM's Unix socket is (so it can forward validated requests)
  *   - What document root to use (passed as DOCUMENT_ROOT in FastCGI variables)
+ *   - What Host headers each backend should handle (virtual hosting)
  *   - What constraints to enforce (max body size, allowed methods, upload limits)
  *
- * The constraints are reasonable defaults. Edit /etc/qbixproxy/qbixproxy.json
- * after setup if your application needs different limits (e.g. larger uploads).
+ * When $sites is provided (multi-site mode), one backend entry is generated per
+ * site, each with its own hosts[], document_root, and the shared FPM socket.
+ * A final catch-all backend (no hosts key) is added for unrecognised Host headers.
+ *
+ * When $sites is empty, a single catch-all backend is generated (single-site mode,
+ * backwards-compatible with configs that have no hosts key).
+ *
+ * @param string   $socket   PHP-FPM Unix socket shared by all backends
+ * @param string   $docRoot  Fallback document root (used for the catch-all backend)
+ * @param array    $sites    Optional: [ ['hosts'=>[...], 'document_root'=>'...'], ... ]
  */
-function makeQbixproxyJson(string $socket, string $docRoot): string {
-    return json_encode([
-        'backends' => [
-            'php' => [
+function makeQbixproxyJson(string $socket, string $docRoot, array $sites = []): string {
+    $backends = [];
+
+    if (!empty($sites)) {
+        // Multi-site mode: one backend per detected virtual host
+        foreach ($sites as $i => $site) {
+            $key = 'php-site-' . ($i + 1);
+            $backends[$key] = [
                 'socket'        => $socket,
-                'protocol'      => 'fastcgi',      // talk FastCGI to PHP-FPM
-                'document_root' => $docRoot,        // sets DOCUMENT_ROOT in FastCGI env
-                'routes'        => ['/'],           // handle all paths
-                'constraints'   => [
-                    // Maximum total request body size (8 MB default)
-                    'max_body_bytes'  => 8388608,
-                    'allowed_methods' => ['GET','POST','PUT','PATCH','DELETE','HEAD','OPTIONS'],
-                    // Only accept these Content-Type values; others get 415 Unsupported
-                    'allowed_content_types' => [
-                        'application/x-www-form-urlencoded',
-                        'multipart/form-data',
-                        'application/json',
-                        'text/plain',
-                    ],
-                    'upload' => [
-                        'max_files'          => 20,        // max files per multipart request
-                        'max_file_bytes'     => 10485760,  // 10 MB per file
-                        // Whitelist of allowed file upload extensions
-                        'allowed_extensions' => [
-                            '.jpg','.jpeg','.png','.gif','.webp',
-                            '.pdf','.zip','.doc','.docx','.xls','.xlsx',
-                        ],
-                    ],
-                ],
-            ],
-        ],
-    ], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n";
+                'protocol'      => 'fastcgi',
+                'document_root' => $site['document_root'],
+                'hosts'         => $site['hosts'],
+                'routes'        => ['/'],
+                'constraints'   => defaultConstraints(),
+            ];
+        }
+        // Catch-all for any host not explicitly listed above
+        $backends['php-default'] = [
+            'socket'        => $socket,
+            'protocol'      => 'fastcgi',
+            'document_root' => $docRoot,
+            'routes'        => ['/'],
+            'constraints'   => defaultConstraints(),
+        ];
+    } else {
+        // Single-site mode: one catch-all backend (no hosts key)
+        $backends['php'] = [
+            'socket'        => $socket,
+            'protocol'      => 'fastcgi',
+            'document_root' => $docRoot,
+            'routes'        => ['/'],
+            'constraints'   => defaultConstraints(),
+        ];
+    }
+
+    return json_encode(['backends' => $backends], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n";
 }
 
 /**
@@ -902,20 +980,23 @@ function makeQbixproxyJson(string $socket, string $docRoot): string {
  *     not root. This ensures the process can access the FPM socket.
  *   NoNewPrivileges: The process can never gain elevated privileges via
  *     setuid/setgid or Linux capabilities — even if the binary is exploited.
- *   ProtectSystem=strict: The entire filesystem is read-only except for
- *     /run, /tmp, and paths explicitly opened for writing.
- *   ProtectHome: Blocks access to /home, /root, /run/user.
+ *   ProtectSystem=strict: The entire filesystem is read-only for the process
+ *     (except /run, /tmp, and paths explicitly listed for writing). Note: this
+ *     restricts writes, not reads — the proxy still has read access to the
+ *     filesystem outside /etc/qbixproxy. It cannot write PHP source or database
+ *     config, but it can read them if it were compromised.
+ *   ProtectHome: Blocks access to /home, /root, /run/user entirely.
  *   PrivateTmp: The process gets its own private /tmp that no other process
  *     can see or write to.
- *   ReadOnlyPaths=/etc/qbixproxy: The config directory is readable but the
- *     process cannot modify it even if compromised.
+ *   ReadOnlyPaths=/etc/qbixproxy: Reinforces that the config directory cannot
+ *     be modified by the proxy even if compromised.
  *
- * If the proxy process were ever exploited, these limits ensure the attacker
- * has a process that can open network sockets and read its own config, and
- * nothing else — it cannot read your PHP source code, your database config,
- * your user's home directories, or write anywhere on disk.
+ * @param string $binaryPath Absolute path to the qbixproxy binary.
  */
-function makeSystemdUnit(string $serviceUser = 'www-data'): string {
+function makeSystemdUnit(string $serviceUser = 'www-data', string $binaryPath = '/usr/local/bin/qbixproxy'): string {
+    $exec = escapeshellarg($binaryPath);
+    // Strip the shell-quoting for the unit file value (systemd doesn't use sh quoting here)
+    $exec = $binaryPath;
     return <<<UNIT
 [Unit]
 Description=Qbix proxy — structural security proxy for PHP
@@ -925,12 +1006,11 @@ Wants=php-fpm.service
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/qbixproxy --config=/etc/qbixproxy/qbixproxy.json --port=8080 --host=127.0.0.1
+ExecStart=$exec --config=/etc/qbixproxy/qbixproxy.json --port=8080 --host=127.0.0.1
 Restart=always
 RestartSec=2
 
-# Security hardening — if the proxy process is ever compromised, the attacker
-# gets a process that can open sockets and nothing else.
+# Security hardening
 User=$serviceUser
 Group=$serviceUser
 NoNewPrivileges=true
@@ -974,9 +1054,52 @@ function patchAndApplyServer(
         return false;
     }
 
+    // Recovery path: config has BOTH inline upstream block AND proxy_pass — it was
+    // patched by an older version of this script that injected upstream into each
+    // site config.  Strip the inline upstream; nginx now gets it from
+    // 00-qbixproxy-upstream.conf (written once per run, before site configs).
+    if ($server === 'nginx'
+            && strpos($orig, 'upstream qbixproxy') !== false
+            && strpos($orig, 'proxy_pass http://qbixproxy') !== false) {
+        sub("Recovery: stripping inline upstream block → now in 00-qbixproxy-upstream.conf");
+        $fixed = stripNginxInlineUpstream($orig);
+        if (!$dryRun) {
+            if ($fixed !== $orig) {
+                $backup = $real . '.bak';
+                if (!@copy($real, $backup)) {
+                    fail("Cannot create backup $backup — skipping recovery");
+                    return false;
+                }
+                if (@file_put_contents($real, $fixed) === false) {
+                    fail("Cannot write $real");
+                    @copy($backup, $real);
+                    return false;
+                }
+                ok("Stripped inline upstream block → $real  (backup: $backup)");
+                $out = []; $rc = 0;
+                exec('timeout 30 nginx -t 2>&1', $out, $rc);
+                if ($rc !== 0) {
+                    fail("nginx config test failed after stripping inline upstream — restoring");
+                    foreach ($out as $l) if (trim($l) !== '') sub($l);
+                    @copy($backup, $real);
+                    ok("Original restored from $backup");
+                    return false;
+                }
+                ok("nginx config test passed");
+            } else {
+                sub("(inline upstream already stripped — no file change needed)");
+            }
+        } else {
+            diff_rem("upstream qbixproxy { server 127.0.0.1:8080; keepalive 32; }");
+            sub("[preview] Would strip inline upstream block from $real");
+        }
+        ok("Already proxied — no further patching needed");
+        return true;
+    }
+
     // Check if this config was already patched by a previous run
     $alreadyPatched = match ($server) {
-        'nginx'  => strpos($orig, 'upstream qbixproxy') !== false,
+        'nginx'  => strpos($orig, 'proxy_pass http://qbixproxy') !== false,
         'apache' => stripos($orig, 'ProxyPass / http://127.0.0.1:8080') !== false,
         'caddy'  => strpos($orig, 'reverse_proxy 127.0.0.1:8080') !== false,
         default  => false,
@@ -1171,50 +1294,197 @@ if (count($servers) > 1) {
     sub("Use --server=NAME to patch only one");
 }
 
-// ── Step 4: Auto-detect document root from config files ───────────────────────
+// ── Step 4: Auto-detect document roots and virtual hosts from config files ───
 //
-// The document root is included in the qbixproxy.json config as DOCUMENT_ROOT,
-// which PHP-FPM uses when evaluating SCRIPT_FILENAME for FastCGI requests.
-// We try to read it from the web server config; if not found, we default to
-// the common /var/www/html location.
+// DOCUMENT_ROOT must be correct per virtual host so that PHP resolves
+// SCRIPT_FILENAME to the right location.  We detect:
+//   - Single-site setups: one docRoot, no hosts array in generated config
+//   - Multi-site setups: one entry per server_name/root pair in nginx, with
+//     a hosts[] array so Qbix proxy routes by Host header
 
-$docRoot = '/var/www/html';
+$docRoot = '/var/www/html';     // fallback for single-site / catch-all backend
+$sites   = [];                  // [ ['hosts'=>[...], 'document_root'=>'...'], ... ]
+
 foreach ($servers as $name => $files) {
-    $c    = (string) @file_get_contents($files[0]['real']);
-    $root = null;
-    if ($name === 'nginx'  && preg_match('/^\s*root\s+([^\s;]+)/m', $c, $m))  $root = $m[1];
-    if ($name === 'apache' && preg_match('/DocumentRoot\s+([^\s<]+)/i', $c, $m)) $root = $m[1];
-    if ($name === 'caddy'  && preg_match('/root\s+\*\s+([^\s\n]+)/i', $c, $m))   $root = $m[1];
-    if ($root) { $docRoot = $root; break; }
+    if ($name === 'nginx') {
+        // Parse all nginx server blocks to find server_name + root pairs
+        foreach ($files as $f) {
+            $c = (string) @file_get_contents($f['real']);
+            // Find every server { } block
+            $offset = 0;
+            while (preg_match('/\bserver\s*\{/', $c, $m, PREG_OFFSET_CAPTURE, $offset)) {
+                $bo = $m[0][1] + strlen($m[0][0]) - 1;
+                $bc = matchBrace($c, $bo);
+                if ($bc === -1) { $offset = $m[0][1] + 1; continue; }
+                $block = substr($c, $bo + 1, $bc - $bo - 1);
+                $offset = $bc + 1;
+
+                // Extract root directive
+                $root = null;
+                if (preg_match('/^\s*root\s+([^\s;]+)/m', $block, $rm)) {
+                    $root = trim($rm[1]);
+                }
+
+                // Extract server_name values (may be space-separated list)
+                $serverNames = [];
+                if (preg_match('/^\s*server_name\s+([^;]+);/m', $block, $snm)) {
+                    foreach (preg_split('/\s+/', trim($snm[1])) as $sn) {
+                        $sn = trim($sn);
+                        if ($sn !== '' && $sn !== '_') $serverNames[] = $sn;
+                    }
+                }
+
+                if ($root && !empty($serverNames)) {
+                    $sites[] = ['hosts' => $serverNames, 'document_root' => $root];
+                    // Use first detected root as the fallback too
+                    if ($docRoot === '/var/www/html') $docRoot = $root;
+                }
+            }
+        }
+    } elseif ($name === 'apache') {
+        // Parse all <VirtualHost> blocks across every Apache config file we found.
+        // Each block may declare a ServerName + optional ServerAlias + DocumentRoot.
+        // We collect them the same way we collect nginx server_name + root pairs.
+        foreach ($files as $f) {
+            $c = stripComments((string) @file_get_contents($f['real']));
+            $offset = 0;
+            while (preg_match('/<VirtualHost[^>]*>/i', $c, $m, PREG_OFFSET_CAPTURE, $offset)) {
+                $tagEnd = $m[0][1] + strlen($m[0][0]);
+                $close  = stripos($c, '</VirtualHost>', $tagEnd);
+                if ($close === false) { $offset = $m[0][1] + 1; continue; }
+                $block  = substr($c, $tagEnd, $close - $tagEnd);
+                $offset = $close + strlen('</VirtualHost>');
+
+                // DocumentRoot directive (may be quoted: DocumentRoot "/var/www/..." or unquoted)
+                $root = null;
+                if (preg_match('/^\s*DocumentRoot\s+["\']?([^\s<"\']+)/im', $block, $dm)) {
+                    $root = trim($dm[1]);
+                }
+
+                // ServerName gives the primary hostname; ServerAlias lists aliases.
+                // We skip wildcards (*.example.com) — they don't appear in Host headers.
+                $serverNames = [];
+                if (preg_match('/^\s*ServerName\s+(\S+)/im', $block, $snm)) {
+                    $sn = trim($snm[1]);
+                    if ($sn !== '' && $sn !== 'localhost' && !str_contains($sn, '*')) {
+                        $serverNames[] = $sn;
+                    }
+                }
+                if (preg_match_all('/^\s*ServerAlias\s+(.+)$/im', $block, $sam)) {
+                    foreach ($sam[1] as $aliases) {
+                        foreach (preg_split('/\s+/', trim($aliases)) as $alias) {
+                            $alias = trim($alias);
+                            if ($alias !== '' && $alias !== 'localhost'
+                                && !str_contains($alias, '*')) {
+                                $serverNames[] = $alias;
+                            }
+                        }
+                    }
+                }
+
+                if ($root && !empty($serverNames)) {
+                    $sites[] = ['hosts' => $serverNames, 'document_root' => $root];
+                    if ($docRoot === '/var/www/html') $docRoot = $root;
+                }
+            }
+        }
+    } elseif ($name === 'caddy') {
+        // Parse Caddy site blocks.  Each block starts with the site address(es) on the
+        // same line as the opening brace:
+        //   example.com { root * /var/www/example; php_fastcgi unix//run/... }
+        //   example.com, www.example.com { ... }
+        // We only care about blocks that contain php_fastcgi.
+        foreach ($files as $f) {
+            $c = (string) @file_get_contents($f['real']);
+            $offset = 0;
+            // Match lines of the form "<addresses> {" — the address part is everything
+            // before the opening brace that isn't whitespace-only (global block is excluded).
+            while (preg_match('/^([\w.,:\/ -]+)\s*\{/m', $c, $m, PREG_OFFSET_CAPTURE, $offset)) {
+                $bracePos = $m[0][1] + strlen($m[0][0]) - 1;
+                $bc       = matchBrace($c, $bracePos);
+                if ($bc === -1) { $offset = $m[0][1] + 1; continue; }
+                $block  = substr($c, $bracePos + 1, $bc - $bracePos - 1);
+                $offset = $bc + 1;
+
+                // Only interested in PHP site blocks
+                if (stripos($block, 'php_fastcgi') === false) continue;
+
+                // Address part may be "example.com" or "example.com, www.example.com"
+                $serverNames = [];
+                foreach (preg_split('/[\s,]+/', trim($m[1][0])) as $addr) {
+                    $addr = trim($addr);
+                    // Strip http:// / https:// prefixes and :port suffixes
+                    $addr = (string) preg_replace('/^https?:\/\//', '', $addr);
+                    $addr = (string) preg_replace('/:\d+$/', '', $addr);
+                    // Require a dot so we exclude bare names like "localhost"
+                    if ($addr !== '' && !str_contains($addr, '*') && str_contains($addr, '.')) {
+                        $serverNames[] = $addr;
+                    }
+                }
+
+                // root * /path/to/webroot
+                $root = null;
+                if (preg_match('/^\s*root\s+\*\s+(\S+)/m', $block, $rm)) {
+                    $root = trim($rm[1]);
+                }
+
+                if ($root && !empty($serverNames)) {
+                    $sites[] = ['hosts' => $serverNames, 'document_root' => $root];
+                    if ($docRoot === '/var/www/html') $docRoot = $root;
+                }
+            }
+        }
+    }
 }
-sub("document_root: $docRoot");
+
+if (count($sites) > 1) {
+    sub("multi-site mode: " . count($sites) . " virtual host(s) detected");
+    foreach ($sites as $s) {
+        sub("  " . implode(', ', $s['hosts']) . "  →  " . $s['document_root']);
+    }
+} else {
+    // Single-site: don't generate a hosts array (backwards-compatible catch-all)
+    $sites = [];
+    sub("document_root: $docRoot");
+}
 
 // ── Step 5: Preview what will be created/changed ──────────────────────────────
 head("4. Changes" . ($dryRun ? " (preview)" : ""));
 
 // Files that will be written
-$jsonContent = makeQbixproxyJson($socket, $docRoot);
-$unitContent = makeSystemdUnit($serviceUser);
+$jsonContent = makeQbixproxyJson($socket, $docRoot, $sites);
+$unitContent = makeSystemdUnit($serviceUser, $binary ?? '/usr/local/bin/qbixproxy');
 
 $exists = fn($p) => file_exists($p) ? DIM . ' (overwrite)' . RESET : DIM . ' (new)' . RESET;
 go("/etc/qbixproxy/qbixproxy.json" . $exists('/etc/qbixproxy/qbixproxy.json'));
 go("/etc/systemd/system/qbixproxy.service" . $exists('/etc/systemd/system/qbixproxy.service'));
 
-// Config files that will be patched
+// Config files that will be patched (or recovered)
+if (isset($servers['nginx'])) {
+    go("/etc/nginx/conf.d/00-qbixproxy-upstream.conf"
+        . $exists('/etc/nginx/conf.d/00-qbixproxy-upstream.conf'));
+}
 foreach ($servers as $name => $files) {
     foreach ($files as $f) {
         $link = $f['link'];
         $real = $f['real'];
         $note = ($link !== $real) ? " (patches $real)" : '';
-        go(strtoupper($name) . ": $link$note  →  patched  (.bak backup saved)");
+        $orig = (string) @file_get_contents($real);
+
+        $isNginxRecovery = ($name === 'nginx'
+            && strpos($orig, 'upstream qbixproxy') !== false
+            && strpos($orig, 'proxy_pass http://qbixproxy') !== false);
+        $action = $isNginxRecovery ? 'recovery: strip inline upstream' : 'patched';
+
+        go(strtoupper($name) . ": $link$note  →  $action  (.bak backup saved)");
 
         // Show the key lines changing (what gets removed, what gets added)
-        $orig    = (string) @file_get_contents($real);
-        $patched = match ($name) {
-            'nginx'  => patchNginx($orig),
-            'apache' => patchApache($orig),
-            'caddy'  => patchCaddy($orig),
-            default  => $orig,
+        $patched = match (true) {
+            $isNginxRecovery   => stripNginxInlineUpstream($orig),
+            $name === 'nginx'  => patchNginx($orig),
+            $name === 'apache' => patchApache($orig),
+            $name === 'caddy'  => patchCaddy($orig),
+            default            => $orig,
         };
         showKeyChanges($name, $orig, $patched);
     }
@@ -1230,15 +1500,130 @@ if ($svcActive === 'active') {
 if ($dryRun) {
     echo "\n";
     bar();
-    if (!$isRoot) {
-        echo BOLD . "  Preview complete. To apply these changes, run with sudo:" . RESET . "\n\n";
-        cmd("sudo php " . basename(__FILE__) . ($flagServer ? " --server=$flagServer" : ""));
-    } else {
-        // Running as root with --dry-run
-        echo BOLD . "  Preview complete. To apply, run without --dry-run:" . RESET . "\n\n";
-        cmd("sudo php " . basename(__FILE__) . ($flagServer ? " --server=$flagServer" : ""));
+
+    $scriptName = basename(__FILE__);
+    $serverFlag = $flagServer ? " --server=$flagServer" : "";
+
+    if ($isRoot) {
+        // Root + --dry-run: just tell them to drop the flag
+        echo BOLD . "  Preview complete. To apply, run without --dry-run:\n" . RESET . "\n";
+        cmd("sudo php $scriptName$serverFlag");
+        echo "\n";
+        bar();
+        exit(0);
     }
+
+    // Non-root: offer both the automatic path AND a full set of manual steps.
+    echo BOLD . "  Preview complete." . RESET . "\n\n";
+    echo CYAN . "  Automatic (recommended):" . RESET . "\n\n";
+    cmd("sudo php $scriptName$serverFlag");
     echo "\n";
+    echo CYAN . "  Or apply manually — exact copy-paste steps:" . RESET . "\n\n";
+
+    // ── Manual step 1: JSON config ────────────────────────────────────────────
+    echo BOLD . "  1. Create /etc/qbixproxy/qbixproxy.json\n" . RESET;
+    echo "\n";
+    cmd("sudo mkdir -p /etc/qbixproxy");
+    echo "       sudo tee /etc/qbixproxy/qbixproxy.json <<'JSONEOF'\n";
+    echo $jsonContent . "\n";
+    echo "JSONEOF\n";
+    echo "\n";
+
+    // ── Manual step 2: web server configs ────────────────────────────────────
+    // Write each patched config to a securely-created temp file so the user
+    // can diff and review before moving it into place.  tempnam() creates the
+    // file with mode 0600, owned by the current process — no predictable path
+    // that another process could race to read or overwrite.
+    $patchedFiles = [];   // [ ['tmp'=>..., 'real'=>..., 'server'=>...], ... ]
+    foreach ($servers as $sname => $files) {
+        foreach ($files as $f) {
+            $orig = (string) @file_get_contents($f['real']);
+            $isNginxRecovery = ($sname === 'nginx'
+                && strpos($orig, 'upstream qbixproxy') !== false
+                && strpos($orig, 'proxy_pass http://qbixproxy') !== false);
+            $patched = match (true) {
+                $isNginxRecovery    => stripNginxInlineUpstream($orig),
+                $sname === 'nginx'  => patchNginx($orig),
+                $sname === 'apache' => patchApache($orig),
+                $sname === 'caddy'  => patchCaddy($orig),
+                default             => $orig,
+            };
+            $tmpPath = tempnam(sys_get_temp_dir(), 'qbixproxy-' . $sname . '-');
+            if ($tmpPath === false || @file_put_contents($tmpPath, $patched) === false) {
+                warn("Could not write temp file for $sname:" . $f['real'] . " — skipping diff");
+                continue;
+            }
+            $patchedFiles[] = ['tmp' => $tmpPath, 'real' => $f['real'], 'server' => $sname];
+        }
+    }
+
+    if ($patchedFiles) {
+        echo BOLD . "  2. Patch web server config(s)\n" . RESET;
+        echo DIM . "       (Patched versions written to /tmp for your review.)\n" . RESET;
+        echo "\n";
+        foreach ($patchedFiles as $pf) {
+            $tmp  = $pf['tmp'];
+            $real = $pf['real'];
+            echo "       # Review the diff:\n";
+            cmd("diff $real $tmp");
+            echo "       # If it looks correct, apply:\n";
+            cmd("sudo cp $real $real.bak");   // backup first
+            cmd("sudo cp $tmp $real");
+            echo "\n";
+        }
+    }
+
+    // ── Manual step 3: config test + reload ──────────────────────────────────
+    echo BOLD . "  3. Test the patched config and reload\n" . RESET;
+    echo "\n";
+    foreach (array_keys($servers) as $sname) {
+        match ($sname) {
+            'nginx'  => (function () {
+                cmd("sudo nginx -t");
+                cmd("sudo systemctl reload nginx");
+            })(),
+            'apache' => (function () {
+                $svc = is_file('/etc/debian_version') ? 'apache2' : 'httpd';
+                cmd("sudo apachectl -t");
+                cmd("sudo systemctl reload $svc");
+            })(),
+            'caddy'  => (function () {
+                cmd("sudo caddy validate --config /etc/caddy/Caddyfile");
+                cmd("sudo systemctl reload caddy");
+            })(),
+            default  => null,
+        };
+        echo "\n";
+    }
+
+    // ── Manual step 4: install binary (only if missing) ──────────────────────
+    if (!$binary) {
+        echo BOLD . "  4. Download and install the qbixproxy binary\n" . RESET;
+        echo "\n";
+        $suffix = php_uname('m') === 'aarch64' ? 'linux-aarch64' : 'linux-x86_64';
+        cmd("curl -LO https://github.com/Qbix/proxy/releases/latest/download/qbixproxy-$suffix");
+        cmd("sudo install -m 755 qbixproxy-$suffix /usr/local/bin/qbixproxy");
+        echo "\n";
+    }
+
+    // ── Manual step 5: systemd service ───────────────────────────────────────
+    $unitStep = $binary ? 4 : 5;
+    echo BOLD . "  $unitStep. Install and start the systemd service\n" . RESET;
+    echo "\n";
+    echo "       sudo tee /etc/systemd/system/qbixproxy.service <<'UNITEOF'\n";
+    echo $unitContent . "\n";
+    echo "UNITEOF\n";
+    echo "\n";
+    cmd("sudo systemctl daemon-reload");
+    cmd("sudo systemctl enable --now qbixproxy");
+    echo "\n";
+
+    // ── Verify ────────────────────────────────────────────────────────────────
+    echo BOLD . "  Verify\n" . RESET;
+    echo "\n";
+    cmd("curl http://127.0.0.1:8080/Q/health");
+    echo "\n";
+
     bar();
     exit(0);
 }
@@ -1279,9 +1664,67 @@ foreach ($servers as $name => $files) {
         }
     }
 
+    // nginx: write the shared upstream block once before touching any site config.
+    // nginx forbids duplicate upstream definitions — having it in a dedicated file
+    // with a 00- prefix (sorts first alphabetically) keeps exactly one definition
+    // across all includes.
+    $upstreamFileCreated = false;
+    if ($name === 'nginx') {
+        $upstreamFile = '/etc/nginx/conf.d/00-qbixproxy-upstream.conf';
+        if (!file_exists($upstreamFile)) {
+            $upstreamContent = "# Qbix proxy upstream — written by qbixproxy-setup.php\n"
+                . "# Keep this file so nginx can resolve the 'qbixproxy' upstream name\n"
+                . "# referenced in every site config patched by qbixproxy-setup.\n\n"
+                . "upstream qbixproxy {\n    server 127.0.0.1:8080;\n    keepalive 32;\n}\n";
+            if (@file_put_contents($upstreamFile, $upstreamContent) !== false) {
+                ok("Wrote nginx upstream block → $upstreamFile");
+                $upstreamFileCreated = true;
+            } else {
+                fail("Cannot write $upstreamFile — check permissions");
+                $anyFailed = true;
+                continue;
+            }
+        } else {
+            ok("Upstream block already exists: $upstreamFile");
+        }
+    }
+
+    // Track site configs newly patched this run so we can roll them back atomically
+    // if a later file in the same run fails nginx -t.
+    $nginxNewlyPatched = [];
+
     foreach ($files as $f) {
-        if (!patchAndApplyServer($name, $f, false)) {
+        // Snapshot state BEFORE patching so we know if this file was already done
+        $preRead    = ($name === 'nginx') ? (string) @file_get_contents($f['real']) : '';
+        $isNewPatch = ($name === 'nginx'
+            && strpos($preRead, 'proxy_pass http://qbixproxy') === false
+            && strpos($preRead, 'upstream qbixproxy') === false);
+
+        $ok = patchAndApplyServer($name, $f, false);
+
+        if (!$ok) {
             $anyFailed = true;
+            // Roll back all site configs we patched in this run, then remove
+            // the upstream file if we created it — leave the server in a clean state.
+            if ($name === 'nginx') {
+                foreach ($nginxNewlyPatched as $patchedReal) {
+                    $bak = $patchedReal . '.bak';
+                    if (file_exists($bak) && @copy($bak, $patchedReal)) {
+                        warn("Rolled back $patchedReal from backup");
+                    } else {
+                        fail("Could not roll back $patchedReal — manual check required");
+                        sub("Run: sudo cp $bak $patchedReal");
+                    }
+                }
+                if ($upstreamFileCreated) {
+                    @unlink($upstreamFile);
+                    warn("Removed $upstreamFile (rollback)");
+                    $upstreamFileCreated = false;
+                }
+                break;
+            }
+        } elseif ($isNewPatch) {
+            $nginxNewlyPatched[] = $f['real'];
         }
     }
 }
@@ -1300,16 +1743,39 @@ head("7. Starting qbixproxy service");
 // daemon-reload tells systemd about the new service file we just wrote
 runCmd('systemctl daemon-reload', 'systemctl daemon-reload') || exit(1);
 
-// enable --now: enable (so it survives reboots) AND start in one command
-runCmd('systemctl enable --now qbixproxy', 'qbixproxy enabled + started') || exit(1);
+// enable --now: enable (so it survives reboots) AND start in one command.
+// Note: enable --now does NOT restart an already-running service — it only
+// starts it if stopped. We explicitly restart if it's already active so the
+// new configuration and binary path take effect.
+$alreadyActive = trim((string) shell_exec('systemctl is-active qbixproxy 2>/dev/null')) === 'active';
+if ($alreadyActive) {
+    runCmd('systemctl restart qbixproxy', 'qbixproxy restarted (was already running)') || exit(1);
+} else {
+    runCmd('systemctl enable --now qbixproxy', 'qbixproxy enabled + started') || exit(1);
+}
 
 // ── Step 10: Reload each web server ──────────────────────────────────────────
 head("8. Reloading web servers");
 
 // "reload" sends SIGHUP — the web server re-reads its config without dropping
 // existing connections. This is safer than "restart" for production servers.
+// If reload fails, roll back all patched configs and stop the service.
 foreach (array_keys($servers) as $name) {
-    reloadWebServer($name);
+    if (!reloadWebServer($name)) {
+        fail("Web server reload failed — rolling back all patched configs");
+        foreach ($servers[$name] as $f) {
+            $real = $f['real'];
+            $bak  = $real . '.bak';
+            if (file_exists($bak) && @copy($bak, $real)) {
+                warn("Restored $real from backup");
+            } else {
+                fail("Could not restore $real — manual check required");
+                sub("Run: sudo cp $bak $real");
+            }
+        }
+        runCmd('systemctl stop qbixproxy', 'qbixproxy stopped (rollback)');
+        exit(1);
+    }
 }
 
 // ─── Done ─────────────────────────────────────────────────────────────────────

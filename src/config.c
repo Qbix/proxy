@@ -101,6 +101,14 @@ static void load_json(const char* file) {
             const char* docroot = json_str(json_get(bobj, "document_root"));
             if (docroot) be->document_root = strdup(docroot);
 
+            /* hosts — optional; if present, this backend only handles matching Host headers.
+             * A backend with no hosts array is a catch-all and matches any host. */
+            UJson* hosts = json_get(bobj, "hosts");
+            for (int hi = 0; hi < json_obj_size(hosts) && be->n_hosts < PROXY_MAX_HOSTS; hi++) {
+                const char* hv = json_str(json_obj_val(hosts, hi));
+                if (hv) be->hosts[be->n_hosts++] = strdup(hv);
+            }
+
             /* routes */
             UJson* routes = json_get(bobj, "routes");
             for (int ri = 0; ri < json_obj_size(routes) && be->n_routes < PROXY_MAX_ROUTES; ri++) {
@@ -158,10 +166,10 @@ static void load_json(const char* file) {
             }
 
             g_cfg.n_backends++;
-            fprintf(stderr, "[config] backend %s: %s via %s (%d routes)\n",
+            fprintf(stderr, "[config] backend %s: %s via %s (%d host(s), %d route(s))\n",
                     bname, be->socket_path,
                     be->protocol == PROTO_HTTP ? "http" : "fastcgi",
-                    be->n_routes);
+                    be->n_hosts, be->n_routes);
         }
     }
 

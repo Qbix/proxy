@@ -193,6 +193,86 @@ server {
 
 The key change: `fastcgi_pass unix:/run/php/php-fpm.sock` becomes `proxy_pass http://qbixproxy`. nginx now sends HTTP to proxy, and proxy handles the FastCGI protocol to PHP-FPM.
 
+### Multiple sites on one server
+
+A single Qbix proxy instance handles all your virtual hosts. Add a `hosts` array to each backend in `qbixproxy.json`, then point every nginx `server {}` block at the same `upstream`. Qbix proxy routes by `Host` header to the matching backend with its own socket and `DOCUMENT_ROOT`.
+
+`/etc/qbixproxy/qbixproxy.json`:
+
+```json
+{
+  "backends": {
+    "site-a": {
+      "socket":        "/run/php-fpm/site-a.sock",
+      "protocol":      "fastcgi",
+      "document_root": "/var/www/site-a",
+      "hosts":         ["site-a.example.com", "www.site-a.example.com"],
+      "routes":        ["/"]
+    },
+    "site-b": {
+      "socket":        "/run/php-fpm/site-b.sock",
+      "protocol":      "fastcgi",
+      "document_root": "/var/www/site-b",
+      "hosts":         ["site-b.example.com"],
+      "routes":        ["/"]
+    }
+  }
+}
+```
+
+nginx config — one `upstream` block, shared by all `server {}` blocks:
+
+```nginx
+upstream qbixproxy {
+    server 127.0.0.1:8080;
+    keepalive 32;
+}
+
+server {
+    listen 443 ssl;
+    server_name site-a.example.com www.site-a.example.com;
+    # ssl_certificate ...
+
+    location ~* \.(css|js|jpg|jpeg|png|gif|ico|svg|woff2?)$ {
+        root /var/www/site-a;
+        expires 30d;
+    }
+    location / {
+        proxy_pass         http://qbixproxy;
+        proxy_http_version 1.1;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+        proxy_set_header   Connection        "";
+        client_max_body_size 8m;
+    }
+}
+
+server {
+    listen 443 ssl;
+    server_name site-b.example.com;
+    # ssl_certificate ...
+
+    location ~* \.(css|js|jpg|jpeg|png|gif|ico|svg|woff2?)$ {
+        root /var/www/site-b;
+        expires 30d;
+    }
+    location / {
+        proxy_pass         http://qbixproxy;
+        proxy_http_version 1.1;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+        proxy_set_header   Connection        "";
+        client_max_body_size 8m;
+    }
+}
+```
+
+**Critical:** `proxy_set_header Host $host` must be present. Qbix proxy uses that header to route the request to the right backend.
+
 ### Step 5: Test and reload
 
 ```bash

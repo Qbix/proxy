@@ -20,17 +20,70 @@ UProxyStats g_proxy_stats[PROXY_MAX_BACKENDS];
 
 /* ── backend matching ────────────────────────────────────────────── */
 
+/*
+ * Normalize a Host header value: strip port suffix and lowercase.
+ * Writes into buf (at most bufsz bytes including NUL).
+ */
+static void normalize_host(const char* host, char* buf, size_t bufsz) {
+    if (!host) { buf[0] = '\0'; return; }
+    snprintf(buf, bufsz, "%s", host);
+    /* strip :port — but not the ] of an IPv6 literal */
+    char* colon = strrchr(buf, ':');
+    if (colon && !strchr(buf, ']')) *colon = '\0';
+    for (char* p = buf; *p; p++) *p = (char)tolower((unsigned char)*p);
+}
+
+/*
+ * Match a request to a backend.
+ *
+ * Matching order (first wins):
+ *   1. Backend declares hosts[] AND request Host matches AND route matches  → use it
+ *   2. Backend declares hosts[] AND request Host matches with no route list → use it
+ *   3. If no host-specific backend matched, try catch-all backends (n_hosts == 0)
+ *      in declaration order, matching by route prefix as before.
+ *
+ * A backend with an empty hosts[] is a catch-all and handles any domain.
+ * This preserves full backwards compatibility: existing single-site configs
+ * with no "hosts" key continue to work exactly as before.
+ */
 UBackend* proxy_match(const UReq* req) {
     if (g_cfg.n_backends == 0) return NULL;
 
+    char req_host[256];
+    normalize_host(ureq_header(req, "host"), req_host, sizeof req_host);
+
+    UBackend* catchall = NULL;  /* best catch-all candidate */
+
     for (int i = 0; i < g_cfg.n_backends; i++) {
         UBackend* be = &g_cfg.backends[i];
-        for (int j = 0; j < be->n_routes; j++) {
-            size_t rlen = strlen(be->routes[j]);
-            if (!strncmp(req->path, be->routes[j], rlen)) return be;
+
+        if (be->n_hosts > 0) {
+            /* host-specific backend: check Host header first */
+            int host_ok = 0;
+            for (int h = 0; h < be->n_hosts; h++) {
+                if (!strcmp(req_host, be->hosts[h])) { host_ok = 1; break; }
+            }
+            if (!host_ok) continue;
+
+            /* Host matches — now check route prefix (if any routes declared) */
+            if (be->n_routes == 0) return be;  /* no route filter → accept */
+            for (int j = 0; j < be->n_routes; j++) {
+                size_t rlen = strlen(be->routes[j]);
+                if (!strncmp(req->path, be->routes[j], rlen)) return be;
+            }
+            /* Host matched but no route matched — keep looking */
+        } else {
+            /* catch-all backend: match by route prefix, remember first match */
+            if (catchall) continue;  /* already have a candidate */
+            if (be->n_routes == 0) { catchall = be; continue; }
+            for (int j = 0; j < be->n_routes; j++) {
+                size_t rlen = strlen(be->routes[j]);
+                if (!strncmp(req->path, be->routes[j], rlen)) { catchall = be; break; }
+            }
         }
     }
-    return NULL;
+
+    return catchall;
 }
 
 /* ── Unix socket connection ──────────────────────────────────────── */
