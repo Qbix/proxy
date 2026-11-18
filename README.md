@@ -13,7 +13,17 @@ Both are rated **CVSS 9.2+** and allow unauthenticated remote code execution ove
 
 These are not the first critical parser vulnerabilities in PHP — CVE-2024-2756, CVE-2024-3096 (multipart parser), CVE-2024-11236 (session upload progress), and CVE-2026-6722 (SOAP use-after-free, CVSS 9.5) follow the same pattern. The underlying issue is structural: PHP's C-level HTTP parsers handle raw attacker-controlled bytes with complex, stateful code that has repeatedly proven vulnerable.
 
-**Discussion:** [Hacker News thread](https://news.ycombinator.com/item?id=50172041) · [Sansec research writeup](https://sansec.io/research/php2shell) · [Forbes coverage](https://www.forbes.com/sites/daveywinder/2026/10/21/critical-php-security-warning-issued-apply-emergency-patch-today/) · [Phoenix Security analysis](https://phoenix.security/php-core-rce-cve-2026-109618-109619-critical-remote-code-execution/) · [Chainguard PHP image tracker](https://cve.chainguard.dev/directory/image/php/vulnerabilities)
+**Discussion:** [Hacker News thread](https://news.ycombinator.com/item?id=50172041) · [Sansec research writeup](https://sansec.io/research/php2shell) · [Forbes coverage](https://www.forbes.com/sites/daveywinder/2026/10/21/critical-php-security-warning-issued-apply-emergency-patch-today/) · [Phoenix Security analysis](https://phoenix.security/php-core-rce-cve-2026-109618-109619-critical-remote-code-exploration/) · [Chainguard PHP image tracker](https://cve.chainguard.dev/directory/image/php/vulnerabilities)
+
+For a full technical explanation of the vulnerabilities and how the proxy stops them, see **[php2shell.md](php2shell.md)**.
+
+On November 17 2026, a second critical pre-authentication RCE was disclosed, this time in the Java runtime itself:
+
+- **[CVE-2026-114938](https://calif.io/java4shell/)** — heap overflow in OpenJDK's handwritten AVX-512 VBMI Base64 decoder. A malformed short Base64 string causes a 62-byte out-of-bounds write past a heap buffer. Because Base64 is decoded before authentication, the attack surface is any Java service that accepts an `Authorization` header — Keycloak, Jira, Confluence, Artifactory, Jenkins, and any framework (Apache Struts, Spring Boot) with an auth layer. Rated **CVSS 9.8**, pre-auth, single HTTP request. Researchers have named this **"Java4Shell"** by analogy with Log4Shell.
+
+**Discussion:** [Research writeup](https://calif.io/java4shell/) · [samczsun client-side exploit](https://x.com/samczsun)
+
+For coverage of both CVEs — including the client-side attack vector where a Java program opening an outbound TLS connection can be compromised — see **[java4shell.md](java4shell.md)**.
 
 ## What Qbix proxy does about it
 
@@ -28,14 +38,15 @@ This means:
 - **Request smuggling** via duplicate Content-Length, mixed Content-Length + Transfer-Encoding, or other ambiguous framing is rejected before it reaches the backend.
 - Future, as-yet-unknown parser vulnerabilities in PHP are mitigated by the same mechanism — the attacker cannot control the byte-level representation that PHP parses.
 
-### 6-stage validation pipeline
+### 7-stage validation pipeline
 
 1. **Content-Type validation** — reject unknown or malformed types
 2. **Method validation** — configurable allowed methods per backend
 3. **Multipart re-serialization** — the core security invariant: multipart bodies are fully parsed, validated (file count, size, extensions, MIME types), then re-serialized with a new random boundary. The backend receives a structurally identical but byte-different body.
 4. **JSON validation** — configurable depth and string size limits
 5. **URL-encoded body validation** — re-serialized from parsed key-value pairs
-6. **Header sanitization** — reject non-ASCII header names, NULL bytes, bare CR/LF, duplicate Content-Length, mixed Content-Length + Transfer-Encoding
+6. **Authorization header normalization** — Base64 payloads in `Authorization: Basic` and `Authorization: Bearer` (JWT) headers are decoded with the proxy's own C decoder and re-encoded canonically. The backend's JVM decoder never sees the client's bytes. Invalid Base64 — including the malformed short strings that trigger the AVX-512 heap overflow in CVE-2026-114938 / Java4Shell — is rejected with HTTP 400. See [java4shell.md](java4shell.md).
+7. **Header sanitization** — reject non-ASCII header names, NULL bytes, bare CR/LF, duplicate Content-Length, mixed Content-Length + Transfer-Encoding
 
 ### Additional protections
 
@@ -385,7 +396,8 @@ CLI flags:
                     │  3. Multipart re-serialize            │
                     │  4. JSON depth/size check             │
                     │  5. URL-encoded re-serialize          │
-                    │  6. Header sanitize                   │
+                    │  6. Authorization normalize (Base64)  │
+                    │  7. Header sanitize                   │
                     ├─────────────────────────────────────┤
                     │  Proxy (proxy.c)                      │
                     │  • backend matching                   │
@@ -416,3 +428,7 @@ The static binary has zero shared library dependencies and runs on any Linux sys
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+This software is a security tool. Its effectiveness depends on correct deployment, configuration, and the threat model of your specific environment. It does not guarantee protection against all current or future vulnerabilities, exploits, or attack techniques. You are responsible for evaluating whether it is appropriate for your use case.

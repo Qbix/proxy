@@ -10,12 +10,15 @@
  *   3. Multipart body re-parsing and re-serialization
  *   4. JSON depth/size validation
  *   5. URL-encoded body validation and re-serialization
- *   6. Header sanitization (strip dangerous, add forwarding headers)
+ *   6. Authorization header normalization (Base64 decode + re-encode)
+ *   7. Header sanitization (strip dangerous, add forwarding headers)
  *
  * The key invariant: after sanitize_request() returns 0 the request
- * body contains bytes that WE generated, not bytes the client sent.
- * This eliminates parser-differential attacks between the proxy and
- * the backend.
+ * body — and all Base64-carrying Authorization headers — contain bytes
+ * that WE generated, not bytes the client sent.  This eliminates
+ * parser-differential attacks (php2shell) and prevents malformed Base64
+ * inputs (java4shell / CVE-2026-114938) from reaching the backend's
+ * JVM decoder.
  */
 #include "userver.h"
 #include <ctype.h>
@@ -459,7 +462,213 @@ int sanitize_urlencoded(UReq* req, UResp* resp, const UBackendConstraints* bc) {
     return 0;
 }
 
-/* ── 6. Header sanitization ──────────────────────────────────────── */
+/* ── 6. Authorization header normalization ───────────────────────── */
+
+/*
+ * Base64 primitives.  We use our own rather than a library so the proxy
+ * stays a single-file build with no extra dependencies.
+ *
+ * We decode the incoming value with our C implementation, then re-encode
+ * it canonically before forwarding.  The backend JVM's AVX-512 Base64
+ * decoder (the vulnerable path in CVE-2026-114938 / Java4Shell) therefore
+ * never sees the attacker's bytes — only the proxy's re-encoded output.
+ * Any malformed input that our decoder can't parse is rejected with 400.
+ */
+
+static const char b64_std_enc[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+static const char b64_url_enc[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+/* Returns the 6-bit decode value for a Base64 character, -1 if invalid.
+   url=1 uses the base64url alphabet (- and _ instead of + and /). */
+static int b64_val(unsigned char c, int url) {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (url) { if (c == '-') return 62;  if (c == '_') return 63; }
+    else     { if (c == '+') return 62;  if (c == '/') return 63; }
+    return -1;
+}
+
+/* Decode base64 (standard or url) into a malloc'd buffer.
+   Returns NULL on any malformed input (invalid chars, bad padding bits).
+   Accepts input with or without '=' padding. */
+static uint8_t* b64_decode(const char* src, size_t slen, size_t* olen, int url) {
+    while (slen > 0 && src[slen - 1] == '=') slen--;
+    if (slen % 4 == 1) return NULL;        /* always invalid */
+
+    uint8_t* out = malloc((slen * 3) / 4 + 2);
+    if (!out) return NULL;
+
+    size_t j = 0;
+    uint32_t acc = 0;
+    int bits = 0;
+
+    for (size_t i = 0; i < slen; i++) {
+        int v = b64_val((unsigned char)src[i], url);
+        if (v < 0) { free(out); return NULL; }
+        acc = (acc << 6) | (uint32_t)v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out[j++] = (uint8_t)(acc >> bits);
+            acc &= (1u << bits) - 1;
+        }
+    }
+    if (bits > 0 && acc != 0) { free(out); return NULL; } /* non-zero padding bits */
+
+    *olen = j;
+    return out;
+}
+
+/* Encode binary data as base64 into a malloc'd NUL-terminated string.
+   url=1: base64url alphabet.  pad=1: append '=' padding. */
+static char* b64_encode(const uint8_t* src, size_t slen, int url, int pad) {
+    const char* a = url ? b64_url_enc : b64_std_enc;
+    char* out = malloc(((slen + 2) / 3) * 4 + 1);
+    if (!out) return NULL;
+
+    size_t j = 0, i = 0;
+    for (; i + 3 <= slen; i += 3) {
+        out[j++] = a[(src[i]     >> 2) & 0x3f];
+        out[j++] = a[((src[i]   << 4) | (src[i+1] >> 4)) & 0x3f];
+        out[j++] = a[((src[i+1] << 2) | (src[i+2] >> 6)) & 0x3f];
+        out[j++] = a[src[i+2] & 0x3f];
+    }
+    size_t rem = slen - i;
+    if (rem == 1) {
+        out[j++] = a[(src[i]  >> 2) & 0x3f];
+        out[j++] = a[(src[i] << 4) & 0x3f];
+        if (pad) { out[j++] = '='; out[j++] = '='; }
+    } else if (rem == 2) {
+        out[j++] = a[(src[i]     >> 2) & 0x3f];
+        out[j++] = a[((src[i]   << 4) | (src[i+1] >> 4)) & 0x3f];
+        out[j++] = a[(src[i+1] << 2) & 0x3f];
+        if (pad) out[j++] = '=';
+    }
+    out[j] = '\0';
+    return out;
+}
+
+/* Replace a header value and track the allocation for later free. */
+static void set_header_value(UReq* req, const char* lname, char* newval) {
+    for (int i = 0; i < req->nh; i++) {
+        if (!strcmp(req->h[i].name, lname)) {
+            req->allocs = realloc(req->allocs, sizeof(char*) * (size_t)(req->nallocs + 1));
+            if (req->allocs) req->allocs[req->nallocs++] = newval;
+            req->h[i].value = newval;
+            return;
+        }
+    }
+    free(newval);  /* header not found — shouldn't happen, but don't leak */
+}
+
+/*
+ * Normalize the Authorization header to prevent malformed Base64 from
+ * reaching the backend.
+ *
+ * Basic <b64>:  decode → verify "user:password" colon → re-encode (std, padded)
+ * Bearer <jwt>: if 3-segment JWT, decode each segment → re-encode (base64url, unpadded)
+ *               non-JWT Bearer tokens (opaque strings) are left as-is.
+ */
+static int sanitize_authorization(UReq* req, UResp* resp) {
+    const char* auth = ureq_header(req, "authorization");
+    if (!auth) return 0;
+
+    /* ── Basic auth ──────────────────────────────────────────────── */
+    if (!strncasecmp(auth, "basic ", 6)) {
+        const char* b64 = auth + 6;
+        while (*b64 == ' ') b64++;
+
+        size_t dlen;
+        uint8_t* dec = b64_decode(b64, strlen(b64), &dlen, 0);
+        if (!dec) {
+            reject(resp, 400, "Authorization: invalid Base64 in Basic credentials");
+            return -1;
+        }
+
+        /* Decoded bytes must contain a ':' (user:password) */
+        int has_colon = 0;
+        for (size_t k = 0; k < dlen; k++) { if (dec[k] == ':') { has_colon = 1; break; } }
+        if (!has_colon) {
+            free(dec);
+            reject(resp, 400, "Authorization: Basic credentials missing colon separator");
+            return -1;
+        }
+
+        char* reenc = b64_encode(dec, dlen, 0 /* std */, 1 /* padded */);
+        free(dec);
+        if (!reenc) return 0;   /* OOM: skip, don't fail */
+
+        char* newval = NULL;
+        if (asprintf(&newval, "Basic %s", reenc) < 0) { free(reenc); return 0; }
+        free(reenc);
+
+        set_header_value(req, "authorization", newval);
+        return 0;
+    }
+
+    /* ── Bearer auth (JWT only) ──────────────────────────────────── */
+    if (!strncasecmp(auth, "bearer ", 7)) {
+        const char* token = auth + 7;
+        while (*token == ' ') token++;
+
+        /* Only normalize if this looks like a JWT: exactly 2 dots */
+        int dots = 0;
+        for (const char* p = token; *p; p++) { if (*p == '.') dots++; }
+        if (dots != 2) return 0;    /* opaque Bearer token — leave as-is */
+
+        /* Copy and split on '.' */
+        char* tbuf = strdup(token);
+        if (!tbuf) return 0;
+
+        char* segs[3];
+        int nseg = 0;
+        char* p = tbuf;
+        while (*p && nseg < 3) {
+            segs[nseg++] = p;
+            char* dot = strchr(p, '.');
+            if (dot) { *dot = '\0'; p = dot + 1; }
+            else break;
+        }
+        if (nseg != 3) { free(tbuf); return 0; }
+
+        char* reenc[3] = {NULL, NULL, NULL};
+        for (int s = 0; s < 3; s++) {
+            size_t dlen;
+            uint8_t* dec = b64_decode(segs[s], strlen(segs[s]), &dlen, 1 /* url */);
+            if (!dec) {
+                for (int k = 0; k < s; k++) free(reenc[k]);
+                free(tbuf);
+                reject(resp, 400, "Authorization: invalid Base64 in Bearer JWT segment");
+                return -1;
+            }
+            reenc[s] = b64_encode(dec, dlen, 1 /* url */, 0 /* no padding — JWT standard */);
+            free(dec);
+            if (!reenc[s]) {
+                for (int k = 0; k < s; k++) free(reenc[k]);
+                free(tbuf);
+                return 0;   /* OOM: skip */
+            }
+        }
+        free(tbuf);
+
+        char* newval = NULL;
+        if (asprintf(&newval, "Bearer %s.%s.%s", reenc[0], reenc[1], reenc[2]) < 0) {
+            for (int k = 0; k < 3; k++) free(reenc[k]);
+            return 0;
+        }
+        for (int k = 0; k < 3; k++) free(reenc[k]);
+
+        set_header_value(req, "authorization", newval);
+        return 0;
+    }
+
+    return 0;   /* Unknown scheme — leave it alone */
+}
+
+/* ── 7. Header sanitization ──────────────────────────────────────── */
 
 void sanitize_headers(UReq* req, const char* remote_ip, int tls) {
     /* Strip dangerous headers */
@@ -556,6 +765,9 @@ int sanitize_request(UReq* req, UResp* resp, const UBackendConstraints* bc) {
             /* other content types: body passes through as-is */
         }
     }
+
+    /* Authorization header normalization (strips malformed Base64) */
+    if (sanitize_authorization(req, resp)) return -1;
 
     /* Header sanitization (always runs last — adds forwarding headers) */
     sanitize_headers(req, req->remote_ip, req->tls);

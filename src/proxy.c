@@ -4,8 +4,12 @@
  * pipeline checks proxy_match() before the normal static/PHP path.
  * If a backend claims the route, the request goes through the
  * sanitization pipeline (sanitize.c) and is forwarded to the
- * backend over a Unix socket — either FastCGI (for PHP-FPM) or
- * plain HTTP/1.1 (for Node).
+ * backend over a Unix socket or TCP socket — either FastCGI (for
+ * PHP-FPM) or plain HTTP/1.1 (for Node / Qbix webserver).
+ *
+ * Backend "socket" values are interpreted as:
+ *   /path/to/sock        → Unix domain socket
+ *   127.0.0.1:9000       → TCP (host:port)
  *
  * This is optional and off by default.  With n_backends == 0 the
  * server behaves exactly as before.
@@ -13,6 +17,7 @@
 #include "userver.h"
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <netdb.h>
 #include <errno.h>
 #include <ctype.h>
 
@@ -86,9 +91,49 @@ UBackend* proxy_match(const UReq* req) {
     return catchall;
 }
 
-/* ── Unix socket connection ──────────────────────────────────────── */
+/* ── backend connection (Unix socket or TCP) ─────────────────────── */
 
-static int connect_unix(const char* path) {
+/*
+ * Connect to a backend socket.  "path" is either:
+ *   /run/php/fpm.sock        → Unix domain socket (starts with '/')
+ *   127.0.0.1:9000           → TCP host:port (anything else with ':')
+ *
+ * Returns a connected fd on success, -1 on failure (errno set).
+ */
+static int connect_backend(const char* path) {
+    /* TCP: path doesn't start with '/' and contains ':' */
+    if (path[0] != '/' && strchr(path, ':')) {
+        const char* colon = strrchr(path, ':');
+        int port = atoi(colon + 1);
+        if (port <= 0 || port > 65535) { errno = EINVAL; return -1; }
+
+        char host[256];
+        size_t hlen = (size_t)(colon - path);
+        if (hlen == 0 || hlen >= sizeof host) { errno = EINVAL; return -1; }
+        memcpy(host, path, hlen);
+        host[hlen] = '\0';
+
+        char portstr[8];
+        snprintf(portstr, sizeof portstr, "%d", port);
+
+        struct addrinfo hints, *res;
+        memset(&hints, 0, sizeof hints);
+        hints.ai_family   = AF_UNSPEC;   /* IPv4 or IPv6 */
+        hints.ai_socktype = SOCK_STREAM;
+        if (getaddrinfo(host, portstr, &hints, &res) != 0) { errno = EHOSTUNREACH; return -1; }
+
+        int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+        if (fd < 0) { freeaddrinfo(res); return -1; }
+        if (connect(fd, res->ai_addr, res->ai_addrlen) < 0) {
+            int saved = errno;
+            close(fd); freeaddrinfo(res);
+            errno = saved; return -1;
+        }
+        freeaddrinfo(res);
+        return fd;
+    }
+
+    /* Unix domain socket */
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return -1;
 
@@ -98,7 +143,9 @@ static int connect_unix(const char* path) {
     snprintf(addr.sun_path, sizeof addr.sun_path, "%s", path);
 
     if (connect(fd, (struct sockaddr*)&addr, sizeof addr) < 0) {
+        int saved = errno;
         close(fd);
+        errno = saved;
         return -1;
     }
     return fd;
@@ -275,7 +322,7 @@ int proxy_dispatch(UConn* c, UReq* req, UResp* resp, UBackend* be, double t0) {
     }
 
     /* Connect to the backend */
-    int sock = connect_unix(be->socket_path);
+    int sock = connect_backend(be->socket_path);
     if (sock < 0) {
         uresp_init(resp);
         resp->status = 502;
